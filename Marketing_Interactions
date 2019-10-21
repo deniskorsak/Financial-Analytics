@@ -1,0 +1,198 @@
+library(RForcecom)
+library(httr) 
+library(jsonlite)
+library(dplyr)
+library(readr)
+library(stringr)
+library(lubridate)
+library(sqldf)
+library(rdrop2)
+library(googlesheets)
+library(dotenv)
+setwd("~/Desktop/HomeStars/Financial Analytics and Strategy/Marketing/")
+
+options(sqldf.driver="SQLite")
+
+
+###
+if (exists("connection.sql") == FALSE) {
+  connection.sql <-dbConnect(RMySQL::MySQL(),
+                             dbname = dbName,
+                             host = dbHost,
+                             port = dbPort,
+                             user = dbUser,
+                             password = dbPassword)
+} else {
+  print('The connection is already established!')
+}
+
+###
+q_and_u_tab <- unique.data.frame(dbGetQuery(connection.sql,
+                         'SELECT  q.id as quote_request_id, u.id as user_id,
+                          q.created_at as quote_request_created_date,
+                          u.created_at as user_created_date,
+                          u.state
+                          FROM users u
+                          LEFT JOIN quote_requests q ON u.id = q.user_id
+                          WHERE u.created_at > "2018-01-01" AND
+                          q.created_at > "2018-01-01";'))
+
+reviews <- unique.data.frame(dbGetQuery(connection.sql, 'SELECT r.user_id as user_id,
+r.created_at as review_created_date, r.id AS review_id
+FROM reviews r
+                          INNER JOIN category_tags ct
+                          ON r.id = ct.category_taggable_id
+                          INNER JOIN categories cat
+                          ON cat.id = ct.category_id
+                          WHERE state = "approved"
+                          AND money_changed = 1
+                          AND ct.category_taggable_type = "Review"
+                          AND r.created_at > "2018-01-01"'))
+
+
+data_1 <- left_join(q_and_u_tab, reviews,
+                    by = 'user_id')
+
+rm(q_and_u_tab,reviews)
+
+
+
+pre_m.sources <- dbGetQuery(connection.sql, 
+                        'SELECT created_at as created_date_of_m_source,
+                      (case when utm_source like "%google%" or utm_source like "%sem%" then "google"
+                      else utm_source     
+                      end) as utm_source_pre,
+                        utm_codeable_id as quote_request_id,
+                        utm_source
+                        FROM marketing_sources
+                        WHERE created_at < "2019-02-01";')
+
+
+post_m.sources <- dbGetQuery(connection.sql, 
+                             'SELECT created_at as created_date_of_m_source,
+                             (case when utm_source like "%google%" or utm_source like "%sem%" then "google"
+                      else utm_source     
+                      end) as utm_source_post,
+                        utm_codeable_id as interview_id,
+                        utm_source
+                        FROM marketing_sources
+                        WHERE created_at >= "2019-02-01";')
+
+
+
+interviews <- dbGetQuery(connection.sql,
+                         'SELECT quote_request_id, id as interview_id,
+                          max(created_at) as interview_created_date,
+                          user_id
+                          FROM interviews;')
+
+###
+data_2 <- left_join(data_1, pre_m.sources, 
+                       by = 'quote_request_id')
+
+data_3 <- left_join(interviews, post_m.sources, 
+                     by = 'interview_id')
+
+
+
+#colnames(dataset.2)[6] <- 'utm_source_post'
+#colnames(dataset.2)[5] <- 'created_date_of_m_source_post'
+#colnames(dataset.2)[4] <- 'user_id_post'
+
+
+###
+data <- left_join(data_2, data_3,
+                   by = 'user_id')
+
+data <- as_tibble(data)
+#data_v1 <- raw.RecognizedRevenue %>% select(InvoiceItem.ChargeAmount, Invoice.TaxAmount, Account.Batch,Account.HomestarsExternalID__c,
+                                            #Account.Name, Invoice.InvoiceDate, RatePlan.Name) %>%
+  #mutate(Period = if_else(str_detect(RatePlan.Name,'Monthly'), 'Monthly', 'Annual'))
+
+
+dataset <- data %>% mutate(utm_source = if_else(is.na(utm_source_pre), utm_source_post,utm_source_pre),
+                created_date_of_m_source = if_else(is.na(created_date_of_m_source.x), created_date_of_m_source.y,
+                                                   created_date_of_m_source.x)) %>%
+    select(-utm_source_pre,-utm_source_post,-created_date_of_m_source.x,-created_date_of_m_source.y,
+           -quote_request_id.y, -utm_source.x, -utm_source.y) %>% rename(quote_request = quote_request_id.x)
+
+rm(data_1,data_2,data_3,data,interviews, post_m.sources, pre_m.sources)
+
+
+
+
+dataset <- dataset %>% filter((year(dataset$quote_request_created_date) ==
+                                year(dataset$created_date_of_m_source)  &
+                                month(dataset$quote_request_created_date) ==
+                                month(dataset$created_date_of_m_source) |
+                                is.na(dataset$utm_source) |
+                                 year(dataset$review_created_date) ==
+                                 year(dataset$created_date_of_m_source)  &
+                                 month(dataset$review_created_date) ==
+                                 month(dataset$created_date_of_m_source)))
+
+dataset <- dataset %>% select(quote_request,user_id,review_id, interview_id,
+                  utm_source,quote_request_created_date,
+                  created_date_of_m_source,  user_created_date, interview_created_date, review_created_date,
+                  state) %>% rename(utm_created_date = created_date_of_m_source)
+
+
+dataset <- dataset %>% mutate(utm_source = if_else(is.na(dataset$utm_source),
+                                                     'organic', dataset$utm_source)) %>%
+  mutate(utm_source = if_else(dataset$utm_source != 'google' 
+                              & dataset$utm_source !='sem' 
+                              & dataset$utm_source !='b2c_email'
+                              & dataset$utm_source !='internal' 
+                              & dataset$utm_source !='sem%2Cgoogle' 
+                              & dataset$utm_source !='landing_page' 
+                              & dataset$utm_source !='b2c_blog' 
+                              & dataset$utm_source !='organic',
+                              'other_categories',
+                              dataset$utm_source))
+
+dataset$quote_request_created_date <- ymd_hms(dataset$quote_request_created_date,tz=Sys.timezone())
+dataset$review_created_date <- ymd_hms(dataset$review_created_date,tz=Sys.timezone())
+dataset$interview_created_date <- ymd_hms(dataset$interview_created_date,tz=Sys.timezone())
+dataset$utm_created_date <- ymd_hms(dataset$utm_created_date,tz=Sys.timezone())
+
+
+
+dataset <- dataset %>% 
+  mutate(interaction = pmin(quote_request_created_date, interview_created_date, review_created_date,
+                            na.rm = T))
+dataset <- dataset %>% 
+  mutate(column_1 = ifelse(interaction == quote_request_created_date, 'quote_request',
+                                    NA)) %>%
+  mutate(column_2 = ifelse(interaction == interview_created_date, 'interview',
+                                    NA)) %>%
+  mutate(column_3 = ifelse(interaction == review_created_date, 'review',
+                                     NA)) 
+
+dataset$first_interaction <- ifelse(is.na(dataset$column_1) & is.na(dataset$column_2),
+                                    dataset$column_3, NA)
+
+
+dataset$first_interaction <- ifelse(is.na(dataset$column_2) & is.na(dataset$column_3),
+                                    dataset$column_1, dataset$first_interaction)
+
+
+dataset$first_interaction <- ifelse(is.na(dataset$column_1) & is.na(dataset$column_3),
+                                    dataset$column_2, dataset$first_interaction)
+
+dataset <- dataset %>% select(-column_1,-column_2,-column_3)
+
+
+
+dataset <- dataset %>%
+              mutate(first_interaction_utm = ifelse((utm_created_date >= interaction &
+                                                      utm_created_date <= interaction + minutes(10)) |
+                                                      (utm_created_date <= interaction &
+                                                         utm_created_date >= interaction - minutes(10)),
+                                                    utm_source, NA))
+
+dataset <- dataset %>% rename(first_interaction_time = interaction)
+##########################################
+
+dataset_1 <- dataset %>% filter(!is.na(first_interaction_utm))
+dataset_1 %>% group_by(first_interaction_utm) %>% count() %>% arrange(desc(n))
+dataset_1 %>% group_by(first_interaction) %>% count() %>% arrange(desc(n))
