@@ -1,0 +1,159 @@
+start <- Sys.time()
+setwd("~/Desktop/HomeStars/Financial Analytics and Strategy/CS")
+############################################################################################
+
+
+############################################################################################
+####PACKAGES####
+############################################################################################
+library(RForcecom)
+library(httr) 
+library(jsonlite)
+library(dplyr)
+library(readr)
+library(stringr)
+library(lubridate)
+library(sqldf)
+library(rdrop2)
+library(dotenv)
+library(googlesheets)
+options(sqldf.driver="SQLite")
+as.numeric.factor <- function(x) {as.numeric(levels(x))[x]}
+
+
+############################################################################################
+#### FINANCIAL DATA ####
+############################################################################################
+
+#### QUERY ####
+body = paste('{
+               "Format": "csv",
+               "Name": "test",
+               "Query":"select
+  Account.HomestarsExternalID__c,
+  Account.Name,
+  Account.Mrr,
+  RatePlanCharge.Name,
+  RatePlan.Name,
+  Account.CustomerServiceRepName
+               from RatePlanCharge
+               Where Account.Batch != \'Batch5\' and
+               RatePlan.Name != \'Lead Purchase\' and
+               RatePlan.Name != \'Network Access Fee\'and
+               RatePlan.Name != \'AR Recovery\' and 
+               Account.Mrr > 0 and
+               Subscription.Status = \'Active\'",
+               "Status": "Processing",
+               "Zip": false
+               }')
+
+#### MAKE REQUEST ####
+getdata <- POST("https://rest.zuora.com/v1/object/export", auth, body = body)
+r <- fromJSON(content(getdata, type = "text"))
+
+#### CHECK STATUS ####
+r$Status = 'check'
+while(r$Status != 'Completed') {
+  Sys.sleep(240)
+  getdata <- GET(paste("https://rest.zuora.com/v1/object/export/",r$Id, sep = ''), auth)
+  r <- fromJSON(content(getdata, type = "text"))
+  print(r$Status)
+}
+
+getdata <- GET(paste("https://rest.zuora.com/v1/files/",r$FileId, sep = ''), auth)
+data <- content(getdata, type = "text/csv")
+rm(r,getdata,auth,body)
+
+
+
+############################################################################################
+####DATABASE CONNECTION####
+############################################################################################
+if (exists("connection.sql") == FALSE) {
+  connection.sql <-dbConnect(RMySQL::MySQL(),
+                             dbname = dbName,
+                             host = dbHost,
+                             port = dbPort,
+                             user = dbUser,
+                             password = dbPassword)
+} else {
+  print('The connection is already established!')
+}
+
+
+db_data <- dbGetQuery(connection.sql, 
+                      'SELECT subscriptions.company_id as company_id, companies.name as company_name, virtual_budgets.MRR, products.name AS plan_type,
+categories.name as active_category, service_areas.description AS active_service_area
+FROM homestars_production.subscriptions
+LEFT JOIN homestars_production.subscriber_virtual_budgets AS virtual_budgets ON subscriptions.company_id  = virtual_budgets.company_id
+LEFT JOIN homestars_production.subscription_versions AS subscription_versions ON subscriptions.company_id = subscription_versions.company_id
+LEFT JOIN homestars_production.subscription_products AS subscription_products ON subscription_versions.subscription_id = subscription_products.subscription_id
+LEFT JOIN homestars_production.products AS products ON subscription_products.product_id = products.id
+LEFT JOIN homestars_production.company_categories AS company_categories ON company_categories.company_id = subscriptions.company_id
+LEFT JOIN homestars_production.categories AS categories ON categories.id = company_categories.category_id
+LEFT JOIN homestars_production.service_areas AS service_areas ON subscriptions.company_id = service_areas.company_id
+LEFT JOIN homestars_production.companies AS companies ON subscriptions.company_id = companies.id
+WHERE subscriptions.state = "Paid" AND
+products.id != 4 AND
+products.id != 9 AND
+company_categories.enabled = 1 AND
+company_categories.primary = 1 AND
+service_areas.state = "enabled";')
+############################################################################################
+
+db_data %>% select(company_id) %>% summarise(count = n_distinct(company_id))
+
+
+dataset %>% filter(RatePlanCharge.Name != 'Brand Builder')  %>%
+  select(company_id) %>% 
+      summarise(count = n_distinct(company_id))
+
+
+
+dataset <- data %>% tbl_df() %>% 
+  rename(company_id = Account.HomestarsExternalID__c) %>% unique() %>% left_join(db_data)
+
+
+dataset <- dataset %>% 
+  mutate(RatePlanCharge.Name = if_else(str_detect(RatePlanCharge.Name,'Brand Builder'), 'Brand Builder', RatePlanCharge.Name)) %>%
+  mutate(RatePlanCharge.Name = if_else(str_detect(RatePlanCharge.Name,'Monthly'), 'Monthly', RatePlanCharge.Name)) %>%
+  mutate(RatePlanCharge.Name = if_else(str_detect(RatePlanCharge.Name,'Annual'), 'Annual', RatePlanCharge.Name)) 
+
+
+ambigious_ids <- dataset %>% select(company_id, RatePlanCharge.Name) %>% unique() %>%
+    filter(RatePlanCharge.Name != 'Brand Builder') %>% group_by(company_id) %>%
+  mutate(duplicated = if_else(duplicated(company_id), 
+                              1,0)) %>% filter(duplicated == 1) %>% select(company_id)  
+
+dataset <- dataset %>% mutate(RatePlanCharge.Name = if_else(
+                        company_id %in% ambigious_ids$company_id,
+                        'Ambigious (Monthly & Annual)', RatePlanCharge.Name)) 
+
+dataset <- dataset %>% mutate(RatePlanCharge.Name = if_else(
+                                    str_detect(RatePlan.Name,'Brand Builder') & 
+                                      RatePlanCharge.Name == 'Ambigious (Monthly & Annual)', 'Brand Builder',
+                                    RatePlanCharge.Name))
+
+
+rm(db_data,getdata,r, ambigious_ids,data)
+
+
+
+
+
+############################################################################################
+write.csv(dataset,'legacy_transition.csv')
+
+
+####ADD THE FILE TO GOOGLE SHEETS @datateam@homestars.com####
+####COMMENT####
+#### THIS IS NECESSARY TO CONNECT THE FILE TO TABLEAU #### 
+gs_upload("legacy_transition.csv", sheet_title = "legacy_transition_cs", verbose = FALSE, overwrite = TRUE)
+############################################################################################
+
+
+############################################################################################
+end <- Sys.time()
+process <- (end - start)
+paste("To complete the code it took", round(process * 60, digits = 0), "seconds")
+############################################################################################
