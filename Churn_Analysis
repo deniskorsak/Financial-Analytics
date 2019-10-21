@@ -1,8 +1,5 @@
-
-  ####COMMENT####
-  ############################################################################################
-  start <- Sys.time()
-  setwd("~/Desktop/HomeStars/Financial Analytics and Strategy/Churn Reports/Quarterly Churn Reports")
+start <- Sys.time()
+setwd("~/Desktop/HomeStars/Financial Analytics and Strategy/Churn Reports/Quarterly Churn Reports")
   
   ############################################################################################
   ####PACKAGES####
